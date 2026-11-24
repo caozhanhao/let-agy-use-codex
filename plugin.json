@@ -1,0 +1,10 @@
+{
+  "name": "let-agy-use-codex",
+  "version": "0.1.0",
+  "description": "Antigravity plugin bridging AGY to OpenAI Codex via the local Codex app-server daemon (MCP tools + skill + CLI).",
+  "author": {
+    "name": "Zhanhao Cao",
+    "url": "https://github.com/caozhanhao"
+  },
+  "repository": "https://github.com/caozhanhao/let-agy-use-codex"
+}
