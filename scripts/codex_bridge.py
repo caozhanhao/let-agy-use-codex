@@ -95,6 +95,22 @@ def _extract_user_interventions(turns_asc: List[Dict[str, Any]]) -> List[Dict[st
     return interventions
 
 
+def _normalize_service_tier(value: Any) -> Optional[str]:
+    """Normalize user-friendly service tier aliases to Codex's canonical wire ID.
+
+    Codex's catalog advertises Fast mode under id `"priority"` (and
+    `serviceTierForTurn` does not normalize legacy `"fast"` on the server).
+    """
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    if raw.lower() == "fast":
+        return "priority"
+    return raw
+
+
 def _resolve_rpc_items_view(items_view: str, include_tool_outputs: bool) -> str:
     """Map bridge items_view to Codex app-server TurnItemsView.
 
@@ -710,6 +726,9 @@ def op_list_models(args: Dict[str, Any], conn_kw: Dict[str, Any]) -> Dict[str, A
                             "isDefault",
                             "defaultReasoningEffort",
                             "supportedReasoningEfforts",
+                            "defaultServiceTier",
+                            "serviceTiers",
+                            "additionalSpeedTiers",
                         )
                         if m.get(k) is not None
                     }
@@ -731,6 +750,9 @@ def op_start_thread(args: Dict[str, Any], conn_kw: Dict[str, Any]) -> Dict[str, 
         start_params["approvalsReviewer"] = str(args["approvals_reviewer"])
     if args.get("model"):
         start_params["model"] = str(args["model"])
+    service_tier = _normalize_service_tier(args.get("service_tier"))
+    if service_tier:
+        start_params["serviceTier"] = service_tier
     if args.get("effort"):
         start_params["config"] = {"model_reasoning_effort": str(args["effort"])}
     if args.get("ephemeral") is not None:
@@ -754,6 +776,7 @@ def op_start_thread(args: Dict[str, Any], conn_kw: Dict[str, Any]) -> Dict[str, 
             "cwd": res.get("cwd") or cwd,
             "model": res.get("model"),
             "reasoningEffort": res.get("reasoningEffort"),
+            "serviceTier": res.get("serviceTier"),
             "sandbox": res.get("sandbox"),
             "approvalPolicy": res.get("approvalPolicy"),
             "approvalsReviewer": res.get("approvalsReviewer"),
@@ -797,6 +820,9 @@ def op_fork_thread(args: Dict[str, Any], conn_kw: Dict[str, Any]) -> Dict[str, A
         fork_params["approvalPolicy"] = str(args["approval_policy"])
     if args.get("approvals_reviewer"):
         fork_params["approvalsReviewer"] = str(args["approvals_reviewer"])
+    service_tier = _normalize_service_tier(args.get("service_tier"))
+    if service_tier:
+        fork_params["serviceTier"] = service_tier
 
     with CodexAppClient(**conn_kw) as client:
         res = client.call("thread/fork", fork_params) or {}
@@ -813,6 +839,7 @@ def op_fork_thread(args: Dict[str, Any], conn_kw: Dict[str, Any]) -> Dict[str, A
             "name": thread.get("name"),
             "cwd": res.get("cwd") or thread.get("cwd"),
             "model": res.get("model") or thread.get("model"),
+            "serviceTier": res.get("serviceTier"),
             "resumeCommand": f"codex resume {new_id}",
         }
 
@@ -849,6 +876,12 @@ def op_send_turn(args: Dict[str, Any], conn_kw: Dict[str, Any]) -> Dict[str, Any
             turn_params["model"] = str(args["model"])
         if args.get("effort"):
             turn_params["effort"] = str(args["effort"])
+        service_tier = _normalize_service_tier(args.get("service_tier"))
+        if service_tier:
+            turn_params["serviceTier"] = service_tier
+        service_tier_for_turn = _normalize_service_tier(args.get("service_tier_for_turn"))
+        if service_tier_for_turn:
+            turn_params["serviceTierForTurn"] = service_tier_for_turn
         if args.get("approval_policy"):
             turn_params["approvalPolicy"] = str(args["approval_policy"])
 
@@ -1008,6 +1041,9 @@ def op_start_review(args: Dict[str, Any], conn_kw: Dict[str, Any]) -> Dict[str, 
             }
             if args.get("model"):
                 start_params["model"] = str(args["model"])
+            service_tier = _normalize_service_tier(args.get("service_tier"))
+            if service_tier:
+                start_params["serviceTier"] = service_tier
             if args.get("effort"):
                 start_params["config"] = {"model_reasoning_effort": str(args["effort"])}
             started_meta = client.call("thread/start", start_params) or {}
@@ -1034,6 +1070,7 @@ def op_start_review(args: Dict[str, Any], conn_kw: Dict[str, Any]) -> Dict[str, 
         if created_new:
             out["model"] = started_meta.get("model")
             out["reasoningEffort"] = started_meta.get("reasoningEffort")
+            out["serviceTier"] = started_meta.get("serviceTier")
         if args.get("wait"):
             out["waitResult"] = _wait_for_turn_readonly(
                 client,
@@ -1154,7 +1191,7 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "codex_list_models",
-        "description": "List available Codex models advertised by the running Codex app-server. Read-only.",
+        "description": "List available Codex models, reasoning efforts, and service tiers (e.g. fast) advertised by the running Codex app-server. Read-only.",
         "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "handler": op_list_models,
@@ -1172,6 +1209,7 @@ TOOLS: List[Dict[str, Any]] = [
                 "prompt": {"type": "string", "description": "Optional initial prompt to start immediately."},
                 "model": {"type": "string"},
                 "effort": {"type": "string", "description": "Reasoning effort override (e.g. medium, high, xhigh)."},
+                "service_tier": {"type": "string", "description": "Optional service tier override (e.g. 'fast'/'priority' for 2x Fast mode, or 'default' for standard); omit to inherit ~/.codex/config.toml default."},
                 "sandbox": {"type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"], "description": "Optional sandbox override; omit to inherit ~/.codex/config.toml default."},
                 "approval_policy": {"type": "string", "enum": ["on-request", "untrusted", "never"], "description": "Optional approval policy override; omit to inherit ~/.codex/config.toml default."},
                 "approvals_reviewer": {"type": "string", "enum": ["user", "auto_review"], "description": "Optional approvals reviewer override; omit to inherit ~/.codex/config.toml default (e.g. Approve for me)."},
@@ -1195,6 +1233,7 @@ TOOLS: List[Dict[str, Any]] = [
                 "thread_id": {"type": "string"},
                 "name": {"type": "string"},
                 "cwd": {"type": "string"},
+                "service_tier": {"type": "string", "description": "Optional service tier override (e.g. 'fast' or 'default')."},
                 "sandbox": {"type": "string", "enum": ["read-only", "workspace-write", "danger-full-access"]},
                 "approval_policy": {"type": "string", "enum": ["on-request", "untrusted", "never"]},
                 "approvals_reviewer": {"type": "string", "enum": ["user", "auto_review"]},
@@ -1216,6 +1255,8 @@ TOOLS: List[Dict[str, Any]] = [
                 "confirm_modify_thread": {"type": "boolean", "description": "Must be true ONLY if this thread is AGY-owned or the user explicitly authorized modifying it."},
                 "model": {"type": "string"},
                 "effort": {"type": "string"},
+                "service_tier": {"type": "string", "description": "Override the thread's service tier for this and subsequent turns (e.g. 'fast'/'priority' or 'default')."},
+                "service_tier_for_turn": {"type": "string", "description": "Override the service tier for THIS turn only without changing the thread default (e.g. 'fast'/'priority' or 'default')."},
                 "approval_policy": {"type": "string", "enum": ["on-request", "untrusted", "never"]},
                 "wait": {"type": "boolean", "default": False},
                 "timeout_seconds": {"type": "number", "minimum": 1, "maximum": 600, "default": 180},
@@ -1291,6 +1332,7 @@ TOOLS: List[Dict[str, Any]] = [
                 "name": {"type": "string"},
                 "model": {"type": "string", "description": "Optional model override when creating a new review thread."},
                 "effort": {"type": "string", "description": "Optional reasoning effort override when creating a new review thread (e.g. medium, high, xhigh)."},
+                "service_tier": {"type": "string", "description": "Optional service tier override when creating a new review thread (e.g. 'fast' or 'default')."},
                 "wait": {"type": "boolean", "default": False},
                 "timeout_seconds": {"type": "number", "minimum": 1, "maximum": 600, "default": 240},
                 "include_tool_outputs": {"type": "boolean", "default": False},
@@ -1522,6 +1564,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
     p_start.add_argument("--prompt")
     p_start.add_argument("--model")
     p_start.add_argument("--effort")
+    p_start.add_argument("--service-tier")
     p_start.add_argument("--sandbox", default=None, choices=["read-only", "workspace-write", "danger-full-access"])
     p_start.add_argument("--approval-policy", default=None, choices=["on-request", "untrusted", "never"])
     p_start.add_argument("--approvals-reviewer", default=None, choices=["user", "auto_review"])
@@ -1532,6 +1575,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
     p_fork.add_argument("thread_id")
     p_fork.add_argument("--name")
     p_fork.add_argument("--cwd")
+    p_fork.add_argument("--service-tier")
 
     p_send = sub.add_parser("send", help="Send a prompt to an existing idle thread.")
     p_send.add_argument("thread_id")
@@ -1539,6 +1583,8 @@ def build_cli_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--yes", action="store_true", help="Confirm modifying this existing thread.")
     p_send.add_argument("--model")
     p_send.add_argument("--effort")
+    p_send.add_argument("--service-tier")
+    p_send.add_argument("--service-tier-for-turn")
     p_send.add_argument("--wait", action="store_true")
     p_send.add_argument("--timeout", type=float, default=180.0)
 
@@ -1569,6 +1615,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
     p_rev.add_argument("--name")
     p_rev.add_argument("--model")
     p_rev.add_argument("--effort")
+    p_rev.add_argument("--service-tier")
     p_rev.add_argument("--wait", action="store_true")
     p_rev.add_argument("--timeout", type=float, default=240.0)
 
@@ -1655,6 +1702,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "prompt": getattr(ns, "prompt", None),
                 "model": getattr(ns, "model", None),
                 "effort": getattr(ns, "effort", None),
+                "service_tier": getattr(ns, "service_tier", None),
                 "sandbox": getattr(ns, "sandbox", None),
                 "approval_policy": getattr(ns, "approval_policy", None),
                 "approvals_reviewer": getattr(ns, "approvals_reviewer", None),
@@ -1668,6 +1716,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "thread_id": getattr(ns, "thread_id", None),
                 "name": getattr(ns, "name", None),
                 "cwd": getattr(ns, "cwd", None),
+                "service_tier": getattr(ns, "service_tier", None),
             },
         ),
         "send": (
@@ -1678,6 +1727,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "confirm_modify_thread": getattr(ns, "yes", False),
                 "model": getattr(ns, "model", None),
                 "effort": getattr(ns, "effort", None),
+                "service_tier": getattr(ns, "service_tier", None),
+                "service_tier_for_turn": getattr(ns, "service_tier_for_turn", None),
                 "wait": getattr(ns, "wait", False),
                 "timeout_seconds": getattr(ns, "timeout", 180.0),
             },
@@ -1720,6 +1771,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "name": getattr(ns, "name", None),
                 "model": getattr(ns, "model", None),
                 "effort": getattr(ns, "effort", None),
+                "service_tier": getattr(ns, "service_tier", None),
                 "wait": getattr(ns, "wait", False),
                 "timeout_seconds": getattr(ns, "timeout", 240.0),
             },

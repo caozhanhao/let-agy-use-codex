@@ -338,6 +338,62 @@ class FormattingAndGuardrailTests(unittest.TestCase):
                 },
             )
 
+    def test_service_tier_propagation_and_model_listing(self) -> None:
+        fake_client = mock.MagicMock()
+        fake_client.__enter__.return_value = fake_client
+        fake_client.call.return_value = {
+            "data": [
+                {
+                    "id": "codex-test-model",
+                    "model": "codex-test-model",
+                    "defaultServiceTier": "default",
+                    "serviceTiers": [{"id": "fast", "name": "Fast", "description": "Faster"}],
+                }
+            ]
+        }
+        with mock.patch.object(bridge, "CodexAppClient", return_value=fake_client):
+            models = bridge.op_list_models({}, {})
+            self.assertEqual(models["models"][0]["defaultServiceTier"], "default")
+            self.assertEqual(models["models"][0]["serviceTiers"][0]["id"], "fast")
+
+        fake_start = mock.MagicMock()
+        fake_start.__enter__.return_value = fake_start
+        fake_start.call.return_value = {
+            "thread": {"id": "tid-fast"},
+            "cwd": REPO_ROOT,
+            "model": "codex-test-model",
+            "serviceTier": "priority",
+        }
+        with mock.patch.object(bridge, "CodexAppClient", return_value=fake_start):
+            res = bridge.op_start_thread({"cwd": REPO_ROOT, "service_tier": "fast"}, {})
+            self.assertEqual(res["serviceTier"], "priority")
+            method, params = fake_start.call.call_args[0]
+            self.assertEqual(method, "thread/start")
+            self.assertEqual(params["serviceTier"], "priority")
+
+        fake_send = mock.MagicMock()
+        fake_send.__enter__.return_value = fake_send
+        fake_send.call.side_effect = [
+            {"thread": {"id": "tid-fast", "status": {"type": "idle"}}},
+            {"data": [{"id": "turn-0", "status": "completed"}]},
+            {"turn": {"id": "turn-1", "status": "inProgress"}},
+        ]
+        with mock.patch.object(bridge, "CodexAppClient", return_value=fake_send):
+            bridge.op_send_turn(
+                {
+                    "thread_id": "tid-fast",
+                    "prompt": "go",
+                    "confirm_modify_thread": True,
+                    "service_tier": "default",
+                    "service_tier_for_turn": "fast",
+                },
+                {},
+            )
+            send_method, send_params = fake_send.call.call_args_list[2][0]
+            self.assertEqual(send_method, "turn/start")
+            self.assertEqual(send_params["serviceTier"], "default")
+            self.assertEqual(send_params["serviceTierForTurn"], "priority")
+
 
 class McpProtocolTests(unittest.TestCase):
     def test_mcp_initialize_and_tools_list(self) -> None:

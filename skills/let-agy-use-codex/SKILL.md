@@ -29,12 +29,12 @@ This plugin connects Antigravity directly to the user's running **OpenAI Codex `
 - `codex_list_turns` — Paginate older turns (`sort_direction="desc"`, `limit=5`, `cursor=...`).
 - `codex_get_turn_details` — Fetch full command outputs and file diffs for **one specific** `turn_id`.
 - `codex_wait_turn` — Block locally (0 LLM polling tokens) until an active turn finishes or needs human approval.
-- `codex_list_models` — Check available Codex models.
+- `codex_list_models` — Check available Codex models, reasoning efforts, and service tiers (e.g. `fast`).
 
 ### Write / Interactive
-- `codex_start_thread` — Create a new thread on the shared daemon (optionally with `name`, `prompt`, `sandbox`, `wait=true`).
-- `codex_fork_thread` — Fork an existing thread into a new isolated copy.
-- `codex_send_turn` — Send a prompt to an idle thread (requires `confirm_modify_thread=true`).
+- `codex_start_thread` — Create a new thread on the shared daemon (optionally with `name`, `prompt`, `model`, `effort`, `service_tier`, `sandbox`, `wait=true`).
+- `codex_fork_thread` — Fork an existing thread into a new isolated copy (optional `service_tier` override).
+- `codex_send_turn` — Send a prompt to an idle thread (requires `confirm_modify_thread=true`; supports `service_tier` and single-turn `service_tier_for_turn`).
 - `codex_steer_turn` — Mid-flight course-correction on an `inProgress` turn (requires `confirm_modify_thread=true`).
 - `codex_queue_message` — Queue a follow-up via `codex queue` without interrupting (requires `confirm_modify_thread=true`).
 - `codex_interrupt_turn` — Stop an `inProgress` turn (requires `confirm_modify_thread=true`).
@@ -45,7 +45,7 @@ This plugin connects Antigravity directly to the user's running **OpenAI Codex `
 - **Inspecting a thread**: Start with `codex_read_thread(thread_id=..., recent_turns=1)` (defaults to `items_view="compact"`, which preserves **all** user messages including mid-turn steers while keeping heavy stdout/diffs compacted). Only call `codex_get_turn_details(thread_id, turn_id)` when you actually need full command stdout or full unified diffs.
 - **Handling human mid-turn steers**: By default, `codex_wait_turn` stays quiet while the user steers Codex directly in the Codex UI, follows any queued/follow-up turn until Codex settles (`follow_new_turns=true`), and surfaces every mid-turn steer / follow-up message in `userInterventions` (and `turn.midTurnSteers`). Always read `userInterventions` when `codex_wait_turn` returns so your understanding stays aligned with what the user told Codex mid-flight. (Pass `return_on_user_steer=true` only if you explicitly want to wake up mid-turn.)
 - **Delegating a task while the user watches**:
-  1. Call `codex_start_thread(cwd=..., name="AGY: <short task>", prompt=..., wait=true)` (inherits the user's `~/.codex/config.toml` defaults for model, effort, sandbox, and approvals unless you explicitly override `model`, `effort`, or `sandbox="read-only"`).
+  1. Call `codex_start_thread(cwd=..., name="AGY: <short task>", prompt=..., wait=true)` (inherits the user's `~/.codex/config.toml` defaults for model, effort, service tier, sandbox, and approvals unless you explicitly override `model`, `effort`, `service_tier="fast"`, or `sandbox="read-only"`).
   2. Share the returned `threadId` and `resumeCommand` (`codex resume <id>`) with the user so they can open it in Codex Desktop / IDE / CLI and watch live.
   3. If `waitResult.waitOutcome == "timeout"`, call `codex_wait_turn` to keep waiting; if `"waiting_for_user"`, notify the user to handle the prompt in Codex UI.
 - **When `codex_status` fails to connect**: Tell the user the local Codex app-server daemon is not running yet and suggest starting Codex or running `codex app-server daemon start`.
