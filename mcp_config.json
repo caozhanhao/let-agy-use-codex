@@ -4,7 +4,8 @@
       "command": "python3",
       "args": [
         "${PLUGIN_ROOT}/scripts/mcp_hot_reload.py"
-      ]
+      ],
+      "timeoutSeconds": 660
     }
   }
 }
