@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -19,6 +20,7 @@ from codex_app_client import (  # noqa: E402
     CLIENT_VERSION,
     CodexAppClient,
     CodexBridgeError,
+    CodexRpcError,
     find_codex_binary,
 )
 
@@ -149,6 +151,38 @@ def format_item(
             max_output_chars if include_tool_outputs else 8000,
         )
         out = {"type": "agentMessage", "id": item.get("id"), "text": text}
+        if item.get("phase") is not None:
+            out["phase"] = item.get("phase")
+        if item.get("questions"):
+            out["questions"] = item.get("questions")
+        if truncated:
+            out["truncated"] = True
+        return out
+
+    if item_type in ("enteredReviewMode", "exitedReviewMode"):
+        review_limit = max_output_chars if include_tool_outputs else 12000
+        review_text, truncated = _truncate(str(item.get("review") or ""), review_limit)
+        out = {"type": item_type, "id": item.get("id"), "review": review_text}
+        if truncated:
+            out["truncated"] = True
+        return out
+
+    if item_type == "plan":
+        plan_limit = max_output_chars if include_tool_outputs else 12000
+        text, truncated = _truncate(str(item.get("text") or ""), plan_limit)
+        out = {"type": "plan", "id": item.get("id"), "text": text}
+        if truncated:
+            out["truncated"] = True
+        return out
+
+    if item_type == "hookPrompt":
+        frags = [
+            str(f.get("text") or "")
+            for f in (item.get("fragments") or [])
+            if isinstance(f, dict) and f.get("text")
+        ]
+        text, truncated = _truncate("\n".join(frags), 2000)
+        out = {"type": "hookPrompt", "id": item.get("id"), "text": text}
         if truncated:
             out["truncated"] = True
         return out
@@ -207,13 +241,14 @@ def format_item(
             "changes": changes,
         }
 
-    if item_type in ("mcpToolCall", "collabAgentToolCall"):
+    if item_type == "mcpToolCall":
         out = {
-            "type": item_type,
+            "type": "mcpToolCall",
             "id": item.get("id"),
             "status": item.get("status"),
-            "tool": item.get("tool") or item.get("name"),
             "server": item.get("server"),
+            "tool": item.get("tool") or item.get("name"),
+            "durationMs": item.get("durationMs"),
         }
         if include_tool_outputs and item.get("result") is not None:
             raw_res = json.dumps(item.get("result"), ensure_ascii=False)
@@ -225,21 +260,90 @@ def format_item(
             out["error"] = item.get("error")
         return {k: v for k, v in out.items() if v is not None}
 
+    if item_type == "collabAgentToolCall":
+        out = {
+            "type": "collabAgentToolCall",
+            "id": item.get("id"),
+            "tool": item.get("tool"),
+            "status": item.get("status"),
+            "senderThreadId": item.get("senderThreadId"),
+            "receiverThreadIds": item.get("receiverThreadIds"),
+            "model": item.get("model"),
+            "reasoningEffort": item.get("reasoningEffort"),
+            "agentsStates": item.get("agentsStates"),
+        }
+        if item.get("prompt"):
+            p_text, p_trunc = _truncate(str(item["prompt"]), 1000)
+            out["prompt"] = p_text
+            if p_trunc:
+                out["promptTruncated"] = True
+        return {k: v for k, v in out.items() if v is not None}
+
+    if item_type == "subAgentActivity":
+        out = {
+            "type": "subAgentActivity",
+            "id": item.get("id"),
+            "kind": item.get("kind"),
+            "agentThreadId": item.get("agentThreadId"),
+            "agentPath": item.get("agentPath"),
+            "model": item.get("model"),
+            "reasoningEffort": item.get("reasoningEffort"),
+        }
+        return {k: v for k, v in out.items() if v is not None}
+
+    if item_type == "dynamicToolCall":
+        out = {
+            "type": "dynamicToolCall",
+            "id": item.get("id"),
+            "namespace": item.get("namespace"),
+            "tool": item.get("tool"),
+            "status": item.get("status"),
+            "success": item.get("success"),
+            "durationMs": item.get("durationMs"),
+        }
+        if include_tool_outputs and item.get("contentItems") is not None:
+            raw_res = json.dumps(item.get("contentItems"), ensure_ascii=False)
+            text, truncated = _truncate(raw_res, max_output_chars)
+            out["contentItems"] = text
+            if truncated:
+                out["truncated"] = True
+        return {k: v for k, v in out.items() if v is not None}
+
+    if item_type == "functionCallOutput":
+        out = {
+            "type": "functionCallOutput",
+            "id": item.get("id"),
+            "namespace": item.get("namespace"),
+            "name": item.get("name"),
+        }
+        if include_tool_outputs and item.get("output") is not None:
+            raw_out = json.dumps(item.get("output"), ensure_ascii=False)
+            text, truncated = _truncate(raw_out, max_output_chars)
+            out["output"] = text
+            if truncated:
+                out["truncated"] = True
+        return {k: v for k, v in out.items() if v is not None}
+
     if item_type == "webSearch":
         return {
-            "type": "webSearch",
-            "id": item.get("id"),
-            "query": item.get("query"),
-            "status": item.get("status"),
+            k: v
+            for k, v in {
+                "type": "webSearch",
+                "id": item.get("id"),
+                "query": item.get("query"),
+                "action": item.get("action"),
+                "status": item.get("status"),
+            }.items()
+            if v is not None
         }
 
-    # Generic fallback for contextCompaction, imageView, subAgentActivity, etc.
+    # Generic fallback for contextCompaction, imageView, sleep, imageGeneration, etc.
     compact: Dict[str, Any] = {"type": item_type, "id": item.get("id")}
-    for k in ("status", "name", "path", "text", "summary", "error"):
+    for k in ("status", "name", "path", "text", "review", "summary", "error"):
         if item.get(k) is not None:
             val = item[k]
             if isinstance(val, str):
-                val, _ = _truncate(val, 1000)
+                val, _ = _truncate(val, 2000)
             compact[k] = val
     return compact
 
@@ -360,10 +464,49 @@ def _ensure_loaded(client: CodexAppClient, thread_id: str) -> Dict[str, Any]:
     return thread
 
 
+def _list_all_loaded_thread_ids(client: CodexAppClient) -> List[str]:
+    """Fetch all currently loaded thread IDs across pagination cursors."""
+    loaded_ids: List[str] = []
+    seen: set = set()
+    cursor: Optional[str] = None
+    for _ in range(20):
+        params: Dict[str, Any] = {}
+        if cursor is not None:
+            params["cursor"] = cursor
+        res = client.call("thread/loaded/list", params) or {}
+        for tid in res.get("data") or []:
+            if tid not in seen:
+                seen.add(tid)
+                loaded_ids.append(tid)
+        next_cursor = res.get("nextCursor")
+        if not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+    return loaded_ids
+
+
+def _unwrap_item_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Unwrap `ThreadItemEntry` (`{turnId, item, startedAtMs, completedAtMs}`) returned by `thread/items/list`."""
+    inner = entry.get("item")
+    if isinstance(inner, dict):
+        merged = dict(inner)
+        for ts_key in ("startedAtMs", "completedAtMs"):
+            if entry.get(ts_key) is not None and merged.get(ts_key) is None:
+                merged[ts_key] = entry[ts_key]
+        return merged
+    return entry
+
+
 def _slice_turn_window(
     turns_desc: List[Dict[str, Any]], anchor_turn_id: Optional[str]
 ) -> List[Dict[str, Any]]:
-    """Return chronological turns from anchor_turn_id through the latest turn."""
+    """Return chronological turns from anchor_turn_id through the latest turn.
+
+    When `anchor_turn_id` is explicitly provided but has not appeared in
+    `turns_desc` yet (for example immediately after `turn/start` before the
+    new turn is persisted to the turn store), returns `[]` so waiters never
+    mistake an older completed turn for the newly started turn.
+    """
     if not turns_desc:
         return []
     if not anchor_turn_id:
@@ -376,7 +519,7 @@ def _slice_turn_window(
             found = True
             break
     if not found:
-        return [turns_desc[0]]
+        return []
     collected.reverse()
     return collected
 
@@ -537,8 +680,7 @@ def _wait_for_turn_readonly(
 
 def op_status(args: Dict[str, Any], conn_kw: Dict[str, Any]) -> Dict[str, Any]:
     with CodexAppClient(**conn_kw) as client:
-        loaded = client.call("thread/loaded/list", {})
-        loaded_ids = (loaded or {}).get("data") or []
+        loaded_ids = _list_all_loaded_thread_ids(client)
         return {
             "connected": True,
             "handshake": client.handshake_status,
@@ -567,8 +709,7 @@ def op_list_threads(args: Dict[str, Any], conn_kw: Dict[str, Any]) -> Dict[str, 
         params["cursor"] = args["cursor"]
 
     with CodexAppClient(**conn_kw) as client:
-        loaded = client.call("thread/loaded/list", {})
-        loaded_ids = set((loaded or {}).get("data") or [])
+        loaded_ids = set(_list_all_loaded_thread_ids(client))
         if loaded_only:
             if not loaded_ids:
                 return {"threads": [], "loadedCount": 0, "nextCursor": None}
@@ -594,8 +735,7 @@ def op_read_thread(args: Dict[str, Any], conn_kw: Dict[str, Any]) -> Dict[str, A
     rpc_items_view = _resolve_rpc_items_view(items_view, include_tool_outputs)
 
     with CodexAppClient(**conn_kw) as client:
-        loaded = client.call("thread/loaded/list", {})
-        loaded_ids = set((loaded or {}).get("data") or [])
+        loaded_ids = set(_list_all_loaded_thread_ids(client))
         meta = client.call("thread/read", {"threadId": thread_id, "includeTurns": False})
         thread = (meta or {}).get("thread") or {}
         out: Dict[str, Any] = {
@@ -659,7 +799,7 @@ def op_get_turn_details(args: Dict[str, Any], conn_kw: Dict[str, Any]) -> Dict[s
     thread_id = str(args["thread_id"])
     turn_id = str(args["turn_id"])
     max_output_chars = max(500, min(int(args.get("max_output_chars") or 8000), 50000))
-    limit = max(1, min(int(args.get("limit") or 100), 200))
+    limit = max(1, min(int(args.get("limit") or 100), 100))
 
     params: Dict[str, Any] = {
         "threadId": thread_id,
@@ -671,25 +811,59 @@ def op_get_turn_details(args: Dict[str, Any], conn_kw: Dict[str, Any]) -> Dict[s
         params["cursor"] = args["cursor"]
 
     with CodexAppClient(**conn_kw) as client:
-        res = client.call("thread/items/list", params) or {}
-        raw_items = res.get("data") or []
+        raw_items: List[Dict[str, Any]] = []
+        next_cursor: Optional[str] = None
+        fallback_used = False
+        try:
+            res = client.call("thread/items/list", params) or {}
+            entries = res.get("data") or []
+            raw_items = [
+                _unwrap_item_entry(it) for it in entries if isinstance(it, dict)
+            ]
+            next_cursor = res.get("nextCursor")
+        except CodexRpcError:
+            raw_items = []
+
+        # Fallback for ephemeral/non-paginated threads or unpersisted live turns.
+        if not raw_items and not args.get("cursor"):
+            turns_res = client.call(
+                "thread/turns/list",
+                {
+                    "threadId": thread_id,
+                    "limit": 20,
+                    "sortDirection": "desc",
+                    "itemsView": "full",
+                },
+            ) or {}
+            for tr in turns_res.get("data") or turns_res.get("turns") or []:
+                if isinstance(tr, dict) and tr.get("id") == turn_id:
+                    raw_items = [
+                        _unwrap_item_entry(it)
+                        for it in (tr.get("items") or [])
+                        if isinstance(it, dict)
+                    ]
+                    fallback_used = True
+                    break
+
         formatted = []
         for it in raw_items:
-            if isinstance(it, dict):
-                fmt = format_item(
-                    it,
-                    include_tool_outputs=True,
-                    max_output_chars=max_output_chars,
-                )
-                if fmt is not None:
-                    formatted.append(fmt)
-        return {
+            fmt = format_item(
+                it,
+                include_tool_outputs=True,
+                max_output_chars=max_output_chars,
+            )
+            if fmt is not None:
+                formatted.append(fmt)
+        out: Dict[str, Any] = {
             "threadId": thread_id,
             "turnId": turn_id,
             "count": len(formatted),
             "items": formatted,
-            "nextCursor": res.get("nextCursor"),
+            "nextCursor": next_cursor,
         }
+        if fallback_used:
+            out["source"] = "turns_list_fallback"
+        return out
 
 
 def op_wait_turn(args: Dict[str, Any], conn_kw: Dict[str, Any]) -> Dict[str, Any]:
@@ -978,9 +1152,43 @@ def op_queue_message(args: Dict[str, Any], conn_kw: Dict[str, Any]) -> Dict[str,
     _require_modify_confirmation(args, "codex_queue_message")
     thread_id = str(args["thread_id"])
     message = str(args["message"])
+    resume = bool(args.get("resume", False))
+
+    # Prefer native app-server RPC `thread/queue/add` when supported by the daemon.
+    try:
+        with CodexAppClient(**conn_kw) as client:
+            rpc_res = client.call(
+                "thread/queue/add",
+                {
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": message}],
+                    "clientUserMessageId": str(uuid.uuid4()),
+                },
+            ) or {}
+            if resume:
+                _ensure_loaded(client, thread_id)
+            return {
+                "threadId": thread_id,
+                "queued": True,
+                "via": "app-server-rpc",
+                "queuedSubmission": rpc_res.get("queuedSubmission"),
+            }
+    except CodexRpcError as exc:
+        code = exc.error.get("code")
+        msg_lower = str(exc.error.get("message") or "").lower()
+        unsupported = (
+            code == -32601
+            or "not found" in msg_lower
+            or "not supported" in msg_lower
+            or "unsupported" in msg_lower
+            or "unknown method" in msg_lower
+        )
+        if not unsupported:
+            raise
+
     codex_bin = find_codex_binary()
     cmd = [codex_bin, "queue", "--thread", thread_id, "--message", message]
-    if args.get("resume"):
+    if resume:
         cmd.append("--resume")
     remote_url = conn_kw.get("remote_url") or os.environ.get("CODEX_REMOTE_URL")
     if remote_url:
@@ -994,6 +1202,7 @@ def op_queue_message(args: Dict[str, Any], conn_kw: Dict[str, Any]) -> Dict[str,
     return {
         "threadId": thread_id,
         "queued": True,
+        "via": "codex-cli",
         "output": (proc.stdout or "").strip(),
     }
 
@@ -1161,7 +1370,7 @@ TOOLS: List[Dict[str, Any]] = [
                 "thread_id": {"type": "string"},
                 "turn_id": {"type": "string"},
                 "max_output_chars": {"type": "integer", "minimum": 500, "maximum": 50000, "default": 8000},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 100},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100},
                 "cursor": {"type": "string"},
             },
             "additionalProperties": False,

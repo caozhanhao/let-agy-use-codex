@@ -66,6 +66,24 @@ class WebSocketClientTests(unittest.TestCase):
         # Verify pong frame (opcode 0xA, FIN=1 -> 0x8A) was sent back
         self.assertIn(b"\x8a", bytes(transport.written))
 
+    def test_client_call_ignores_server_initiated_request_with_matching_id(self) -> None:
+        http_resp = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n"
+        # Server sends a server-initiated request carrying both `id` and `method`
+        # before replying to our `agy-1` request.
+        srv_req = _build_server_ws_frame(
+            json.dumps({"jsonrpc": "2.0", "id": "agy-1", "method": "item/approval"}).encode("utf-8")
+        )
+        srv_resp = _build_server_ws_frame(
+            json.dumps({"jsonrpc": "2.0", "id": "agy-1", "result": {"ok": 42}}).encode("utf-8")
+        )
+        transport = FakeTransport(http_resp + srv_req + srv_resp)
+        ws = client_mod.WebSocketClient(transport)
+        ws.handshake()
+        client = client_mod.CodexAppClient()
+        client.ws = ws
+        res = client.call("ping", {})
+        self.assertEqual(res, {"ok": 42})
+
 
 class FormattingAndGuardrailTests(unittest.TestCase):
     def test_format_turn_drops_empty_reasoning_and_compacts_outputs(self) -> None:
@@ -393,6 +411,153 @@ class FormattingAndGuardrailTests(unittest.TestCase):
             self.assertEqual(send_method, "turn/start")
             self.assertEqual(send_params["serviceTier"], "default")
             self.assertEqual(send_params["serviceTierForTurn"], "priority")
+
+    def test_get_turn_details_unwraps_thread_item_entries_and_falls_back(self) -> None:
+        fake_client = mock.MagicMock()
+        fake_client.__enter__.return_value = fake_client
+        fake_client.call.return_value = {
+            "data": [
+                {
+                    "turnId": "turn-7",
+                    "startedAtMs": 1000,
+                    "completedAtMs": 1500,
+                    "item": {
+                        "type": "exitedReviewMode",
+                        "id": "rev-1",
+                        "review": "Found 2 critical issues in foo.py",
+                    },
+                },
+                {
+                    "turnId": "turn-7",
+                    "item": {
+                        "type": "plan",
+                        "id": "plan-1",
+                        "text": "P" * 2500,
+                    },
+                },
+                {
+                    "turnId": "turn-7",
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "a-1",
+                        "text": "Pick one",
+                        "phase": "final_answer",
+                        "questions": [{"id": "q1", "prompt": "Option A or B?"}],
+                    },
+                },
+            ],
+            "nextCursor": None,
+        }
+        with mock.patch.object(bridge, "CodexAppClient", return_value=fake_client):
+            res = bridge.op_get_turn_details(
+                {"thread_id": "tid", "turn_id": "turn-7"}, {}
+            )
+            self.assertEqual(res["count"], 3)
+            self.assertEqual(res["items"][0]["type"], "exitedReviewMode")
+            self.assertEqual(res["items"][0]["review"], "Found 2 critical issues in foo.py")
+            self.assertEqual(res["items"][1]["type"], "plan")
+            self.assertEqual(len(res["items"][1]["text"]), 2500)
+            self.assertEqual(res["items"][2]["questions"][0]["id"], "q1")
+
+        # Fallback when thread/items/list fails (e.g. ephemeral thread)
+        fake_fb = mock.MagicMock()
+        fake_fb.__enter__.return_value = fake_fb
+        fake_fb.call.side_effect = [
+            client_mod.CodexRpcError({"code": -32600, "message": "no rollout found"}),
+            {
+                "data": [
+                    {
+                        "id": "turn-live",
+                        "status": "inProgress",
+                        "items": [{"type": "agentMessage", "id": "a2", "text": "working"}],
+                    }
+                ]
+            },
+        ]
+        with mock.patch.object(bridge, "CodexAppClient", return_value=fake_fb):
+            res2 = bridge.op_get_turn_details(
+                {"thread_id": "tid-eph", "turn_id": "turn-live"}, {}
+            )
+            self.assertEqual(res2["source"], "turns_list_fallback")
+            self.assertEqual(res2["items"][0]["text"], "working")
+
+    def test_wait_turn_does_not_return_older_completed_turn_before_anchor_appears(self) -> None:
+        fake_client = mock.MagicMock()
+        fake_client.__enter__.return_value = fake_client
+        fake_client.call.side_effect = [
+            # Poll 1: turn-2 was just started, not persisted yet; turns/list only shows completed turn-1
+            {"thread": {"id": "tid", "status": {"type": "active", "activeFlags": []}}},
+            {"data": [{"id": "turn-1", "status": "completed", "items": []}]},
+            # Poll 2: turn-2 appears and finishes
+            {"thread": {"id": "tid", "status": {"type": "idle"}}},
+            {
+                "data": [
+                    {"id": "turn-2", "status": "completed", "items": []},
+                    {"id": "turn-1", "status": "completed", "items": []},
+                ]
+            },
+            # Final hydration
+            {
+                "data": [
+                    {
+                        "id": "turn-2",
+                        "status": "completed",
+                        "items": [
+                            {"type": "userMessage", "id": "u2", "content": [{"type": "text", "text": "second"}]},
+                            {"type": "agentMessage", "id": "a2", "text": "second done"},
+                        ],
+                    },
+                    {"id": "turn-1", "status": "completed", "items": []},
+                ]
+            },
+        ]
+        with mock.patch.object(bridge, "CodexAppClient", return_value=fake_client), mock.patch.object(
+            bridge.time, "sleep"
+        ):
+            res = bridge.op_wait_turn(
+                {"thread_id": "tid", "turn_id": "turn-2", "timeout_seconds": 10}, {}
+            )
+            self.assertEqual(res["waitOutcome"], "completed")
+            self.assertEqual(res["watchedTurnIds"], ["turn-2"])
+            self.assertEqual(res["turn"]["id"], "turn-2")
+
+    def test_loaded_list_pagination_and_queue_rpc_fallback(self) -> None:
+        fake_client = mock.MagicMock()
+        fake_client.__enter__.return_value = fake_client
+        fake_client.call.side_effect = [
+            {"data": ["t1", "t2"], "nextCursor": "t2"},
+            {"data": ["t3"], "nextCursor": None},
+        ]
+        ids = bridge._list_all_loaded_thread_ids(fake_client)
+        self.assertEqual(ids, ["t1", "t2", "t3"])
+
+        # Native RPC succeeds
+        fake_q = mock.MagicMock()
+        fake_q.__enter__.return_value = fake_q
+        fake_q.call.return_value = {"queuedSubmission": {"id": "q-1"}}
+        with mock.patch.object(bridge, "CodexAppClient", return_value=fake_q):
+            res = bridge.op_queue_message(
+                {"thread_id": "t1", "message": "next", "confirm_modify_thread": True}, {}
+            )
+            self.assertEqual(res["via"], "app-server-rpc")
+            self.assertTrue(res["queued"])
+
+        # Older daemon returns -32601 -> falls back to CLI
+        fake_q2 = mock.MagicMock()
+        fake_q2.__enter__.return_value = fake_q2
+        fake_q2.call.side_effect = client_mod.CodexRpcError({"code": -32601, "message": "Method not found"})
+        with mock.patch.object(bridge, "CodexAppClient", return_value=fake_q2), mock.patch.object(
+            bridge, "find_codex_binary", return_value="/usr/local/bin/codex"
+        ), mock.patch.object(
+            bridge.subprocess,
+            "run",
+            return_value=mock.Mock(returncode=0, stdout="queued ok", stderr=""),
+        ):
+            res2 = bridge.op_queue_message(
+                {"thread_id": "t1", "message": "next", "confirm_modify_thread": True}, {}
+            )
+            self.assertEqual(res2["via"], "codex-cli")
+            self.assertTrue(res2["queued"])
 
 
 class McpProtocolTests(unittest.TestCase):

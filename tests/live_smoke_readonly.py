@@ -103,12 +103,39 @@ def main() -> int:
             read_resp = recv()
             assert not read_resp["result"]["isError"], read_resp
             read_data = json.loads(read_resp["result"]["content"][0]["text"])
+            recent = read_data.get("recentTurns") or []
             print(
                 f"MCP codex_read_thread OK: id={read_data['thread']['id']}, "
                 f"name={read_data['thread'].get('name')!r}, "
                 f"status={read_data['thread'].get('status')}, "
-                f"recentTurns={len(read_data.get('recentTurns') or [])}"
+                f"recentTurns={len(recent)}"
             )
+            if recent and recent[0].get("id"):
+                turn_id = recent[0]["id"]
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 6,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "codex_get_turn_details",
+                            "arguments": {
+                                "thread_id": first_id,
+                                "turn_id": turn_id,
+                                "max_output_chars": 1000,
+                            },
+                        },
+                    }
+                )
+                det_resp = recv()
+                assert not det_resp["result"]["isError"], det_resp
+                det_data = json.loads(det_resp["result"]["content"][0]["text"])
+                item_types = {it.get("type") for it in (det_data.get("items") or [])}
+                assert "unknown" not in item_types, f"Unwrapped ThreadItemEntry failed: {item_types}"
+                print(
+                    f"MCP codex_get_turn_details OK: turnId={turn_id}, "
+                    f"count={det_data['count']}, types={sorted(t for t in item_types if t)}"
+                )
     finally:
         proc.stdin.close()
         proc.wait(timeout=5)

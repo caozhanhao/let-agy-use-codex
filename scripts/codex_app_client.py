@@ -391,7 +391,7 @@ class CodexAppClient:
         if self.ws is None:
             raise CodexBridgeError("Client is not connected")
         self._next_id += 1
-        req_id = self._next_id
+        req_id = f"agy-{self._next_id}"
         payload: Dict[str, Any] = {
             "jsonrpc": "2.0",
             "id": req_id,
@@ -408,10 +408,11 @@ class CodexAppClient:
                 raise TimeoutError(f"Timed out waiting for response to {method}")
             raw = self.ws.recv_text(timeout=rem)
             msg = json.loads(raw)
-            if msg.get("id") == req_id:
+            # Only match JSON-RPC responses (never server-initiated requests, which carry `method`).
+            if "method" not in msg and msg.get("id") == req_id:
                 if "error" in msg and msg["error"] is not None:
                     raise CodexRpcError(msg["error"])
                 return msg.get("result")
-            # Buffer server notifications; ignore unrelated messages safely.
+            # Buffer server notifications; ignore unrelated server requests safely.
             if "method" in msg and "id" not in msg:
                 self.notifications.append(msg)
